@@ -21,7 +21,13 @@ SHOW_PROGRESS_BAR = os.getenv("SHOW_PROGRESS_BAR", "false").lower() == "true"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-DATABASE_URL = os.getenv("DATABASE_URL")  # Neon pooled URL recommended
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+# ← PUT YOUR PIXELDRAIN DIRECT LINK HERE (or in .env)
+PIXELDRAIN_TARGET_URL = os.getenv(
+    "PIXELDRAIN_TARGET_URL",
+    "https://pixeldrain.com/api/file/XXXXXXXX?download"   # ← replace this
+)
 
 BASE_DIR = os.path.join(os.getcwd(), "data")
 CSV_PATH = os.path.join(BASE_DIR, "Rust_btc_addresses.csv")
@@ -35,6 +41,35 @@ os.makedirs(FOUND_FOLDER, exist_ok=True)
 
 TOTAL_MATCHES = 0
 app = Flask(__name__)
+
+
+# ============================================================
+# DOWNLOAD TARGET FILE FROM PIXELDRAIN (only once)
+# ============================================================
+def download_target_file():
+    if os.path.exists(TARGET_FILE) and os.path.getsize(TARGET_FILE) > 1000:
+        size_mb = os.path.getsize(TARGET_FILE) / (1024 * 1024)
+        print(f"✅ Target file already exists ({size_mb:.1f} MB)")
+        return
+
+    print("⬇️  Downloading BTCtoMatch.txt from Pixeldrain...")
+    try:
+        with requests.get(PIXELDRAIN_TARGET_URL, stream=True, timeout=120) as r:
+            r.raise_for_status()
+            total = int(r.headers.get("content-length", 0))
+            with open(TARGET_FILE, "wb") as f, tqdm(
+                total=total, unit="B", unit_scale=True, desc="Downloading"
+            ) as pbar:
+                for chunk in r.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        f.write(chunk)
+                        pbar.update(len(chunk))
+
+        size_mb = os.path.getsize(TARGET_FILE) / (1024 * 1024)
+        print(f"✅ Download complete: {size_mb:.1f} MB")
+    except Exception as e:
+        print(f"❌ Failed to download target file: {e}")
+        raise
 
 
 # ============================================================
@@ -292,7 +327,6 @@ def split_and_check():
     print("STEP 2: SPLITTING + CHECKING")
     print("=" * 70)
 
-    # Clean old chunks
     for f in os.listdir(CHUNK_DIR):
         if f.startswith(("BTCaddresses_", "BTCprivate_keys_")):
             try:
@@ -300,14 +334,13 @@ def split_and_check():
             except Exception:
                 pass
 
-    # Load targets
     if not os.path.exists(TARGET_FILE):
         raise FileNotFoundError(f"Target file missing: {TARGET_FILE}")
+
     with open(TARGET_FILE, "r", encoding="utf-8") as f:
         targets = set(line.strip().lower() for line in f if line.strip())
     print(f"📦 Loaded {len(targets):,} target addresses")
 
-    # Split CSV into chunks
     with open(CSV_PATH, "r", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         chunk_idx = 0
@@ -339,7 +372,6 @@ def split_and_check():
 
     print(f"✅ Created {chunk_idx} chunks ({line_count:,} rows)")
 
-    # Check every chunk
     for i in range(chunk_idx):
         addr_path = os.path.join(CHUNK_DIR, f"BTCaddresses_{i}.txt")
         key_path = os.path.join(CHUNK_DIR, f"BTCprivate_keys_{i}.txt")
@@ -361,11 +393,9 @@ def split_and_check():
                 matches_in_chunk += 1
                 TOTAL_MATCHES += 1
 
-                # 1. Save locally (ephemeral)
                 with open(os.path.join(FOUND_FOLDER, "Bfound_match.txt"), "a", encoding="utf-8") as f:
                     f.write(key_line + "\n")
 
-                # 2. Telegram (primary notification)
                 msg = (
                     f"🎯 <b>BTC MATCH FOUND!</b>\n\n"
                     f"<b>Address:</b> <code>{addr}</code>\n"
@@ -374,8 +404,6 @@ def split_and_check():
                     f"Time: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC"
                 )
                 send_telegram(msg)
-
-                # 3. Neon Postgres
                 save_match_to_db(addr, key_line)
 
                 print("\n" + "🎯" * 25)
@@ -393,7 +421,6 @@ def split_and_check():
             except Exception:
                 pass
 
-    # Delete big CSV after processing
     if os.path.exists(CSV_PATH):
         try:
             os.remove(CSV_PATH)
@@ -408,6 +435,10 @@ def split_and_check():
 def worker():
     global TOTAL_MATCHES
     iteration = 0
+
+    # Download target file once at start
+    download_target_file()
+
     while True:
         iteration += 1
         print("\n" + "#" * 70)
@@ -449,16 +480,14 @@ def home():
 # ============================================================
 if __name__ == "__main__":
     print("╔" + "═" * 68 + "╗")
-    print("║" + " BTC PIPELINE — RENDER + TELEGRAM + NEON ".center(68) + "║")
+    print("║" + " BTC PIPELINE — RENDER + TELEGRAM + NEON + PIXELDRAIN ".center(68) + "║")
     print("╠" + "═" * 68 + "╣")
     print(f"║  Keys per iteration : {PRIVATE_KEYS_PER_ITERATION:,}")
-    print(f"║  Chunk size         : {CHUNK_SIZE:,}")
-    print(f"║  Telegram           : {'✅ Configured' if TELEGRAM_BOT_TOKEN else '❌ Missing'}")
-    print(f"║  Neon Postgres      : {'✅ Configured' if DATABASE_URL else '❌ Disabled'}")
-    print(f"║  Target file        : {TARGET_FILE}")
+    print(f"║  Telegram           : {'✅' if TELEGRAM_BOT_TOKEN else '❌'}")
+    print(f"║  Neon Postgres      : {'✅' if DATABASE_URL else '❌'}")
+    print(f"║  Pixeldrain Target  : {'✅' if PIXELDRAIN_TARGET_URL else '❌'}")
     print("╚" + "═" * 68 + "╝")
 
-    # Start background worker
     t = threading.Thread(target=worker, daemon=True)
     t.start()
 
