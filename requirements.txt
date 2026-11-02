@@ -1,0 +1,5 @@
+flask
+tqdm
+python-dotenv
+requests
+psycopg2-binary
