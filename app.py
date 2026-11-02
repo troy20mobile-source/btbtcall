@@ -268,4 +268,199 @@ cd btc_range
 cargo build --release
 ./target/release/btc_range {num_private_keys} "{CSV_PATH}"
 '''
-    process = subprocess.Popen(s
+    process = subprocess.Popen(
+        ["bash", "-c", script],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    for line in process.stdout:
+        print(line, end="")
+    process.wait()
+    if process.returncode != 0:
+        raise RuntimeError(f"Generator failed with code {process.returncode}")
+
+
+# ============================================================
+# SPLIT + CHECK
+# ============================================================
+def split_and_check():
+    global TOTAL_MATCHES
+
+    print("\n" + "=" * 70)
+    print("STEP 2: SPLITTING + CHECKING")
+    print("=" * 70)
+
+    # Clean old chunks
+    for f in os.listdir(CHUNK_DIR):
+        if f.startswith(("BTCaddresses_", "BTCprivate_keys_")):
+            try:
+                os.remove(os.path.join(CHUNK_DIR, f))
+            except Exception:
+                pass
+
+    # Load targets
+    if not os.path.exists(TARGET_FILE):
+        raise FileNotFoundError(f"Target file missing: {TARGET_FILE}")
+    with open(TARGET_FILE, "r", encoding="utf-8") as f:
+        targets = set(line.strip().lower() for line in f if line.strip())
+    print(f"📦 Loaded {len(targets):,} target addresses")
+
+    # Split CSV into chunks
+    with open(CSV_PATH, "r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        chunk_idx = 0
+        line_count = 0
+        addr_file = None
+        key_file = None
+
+        for row in reader:
+            if line_count % CHUNK_SIZE == 0:
+                if addr_file:
+                    addr_file.close()
+                    key_file.close()
+                addr_path = os.path.join(CHUNK_DIR, f"BTCaddresses_{chunk_idx}.txt")
+                key_path = os.path.join(CHUNK_DIR, f"BTCprivate_keys_{chunk_idx}.txt")
+                addr_file = open(addr_path, "w", encoding="utf-8")
+                key_file = open(key_path, "w", encoding="utf-8")
+                print(f"📁 Creating chunk {chunk_idx}")
+                chunk_idx += 1
+
+            address = row["compressed_btc_address"]
+            private_key = row["private_key_hex"]
+            addr_file.write(address + "\n")
+            key_file.write(f"{address} , {private_key}\n")
+            line_count += 1
+
+        if addr_file:
+            addr_file.close()
+            key_file.close()
+
+    print(f"✅ Created {chunk_idx} chunks ({line_count:,} rows)")
+
+    # Check every chunk
+    for i in range(chunk_idx):
+        addr_path = os.path.join(CHUNK_DIR, f"BTCaddresses_{i}.txt")
+        key_path = os.path.join(CHUNK_DIR, f"BTCprivate_keys_{i}.txt")
+
+        with open(addr_path, "r", encoding="utf-8") as af:
+            addresses = [l.strip().lower() for l in af if l.strip()]
+        with open(key_path, "r", encoding="utf-8") as kf:
+            key_lines = [l.strip() for l in kf if l.strip()]
+
+        print(f"🔍 Checking chunk {i} ({len(addresses):,} addresses)")
+
+        iterator = zip(addresses, key_lines)
+        if SHOW_PROGRESS_BAR:
+            iterator = tqdm(iterator, total=len(addresses), desc=f"Chunk {i}")
+
+        matches_in_chunk = 0
+        for addr, key_line in iterator:
+            if addr in targets:
+                matches_in_chunk += 1
+                TOTAL_MATCHES += 1
+
+                # 1. Save locally (ephemeral)
+                with open(os.path.join(FOUND_FOLDER, "Bfound_match.txt"), "a", encoding="utf-8") as f:
+                    f.write(key_line + "\n")
+
+                # 2. Telegram (primary notification)
+                msg = (
+                    f"🎯 <b>BTC MATCH FOUND!</b>\n\n"
+                    f"<b>Address:</b> <code>{addr}</code>\n"
+                    f"<b>Key line:</b>\n<code>{key_line}</code>\n\n"
+                    f"Total matches this run: <b>{TOTAL_MATCHES}</b>\n"
+                    f"Time: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC"
+                )
+                send_telegram(msg)
+
+                # 3. Neon Postgres
+                save_match_to_db(addr, key_line)
+
+                print("\n" + "🎯" * 25)
+                print(f"MATCH #{TOTAL_MATCHES}")
+                print(f"Address : {addr}")
+                print(f"Key     : {key_line}")
+                print("🎯" * 25 + "\n")
+
+        print(f"✅ Chunk {i} done → {matches_in_chunk} match(es)")
+
+        if CLEAR_AFTER_CHECK:
+            try:
+                open(addr_path, "w").close()
+                open(key_path, "w").close()
+            except Exception:
+                pass
+
+    # Delete big CSV after processing
+    if os.path.exists(CSV_PATH):
+        try:
+            os.remove(CSV_PATH)
+            print("🧹 Big CSV deleted")
+        except Exception:
+            pass
+
+
+# ============================================================
+# BACKGROUND WORKER
+# ============================================================
+def worker():
+    global TOTAL_MATCHES
+    iteration = 0
+    while True:
+        iteration += 1
+        print("\n" + "#" * 70)
+        print(f"# ITERATION {iteration}  |  Total matches so far: {TOTAL_MATCHES}")
+        print("#" * 70)
+
+        try:
+            run_generator(PRIVATE_KEYS_PER_ITERATION)
+            split_and_check()
+            print(f"\n✅ Iteration {iteration} finished")
+        except Exception as e:
+            error_msg = str(e)[:800]
+            print(f"❌ Iteration failed: {error_msg}")
+            send_telegram(f"⚠️ <b>Pipeline error</b> on iteration {iteration}:\n<code>{error_msg}</code>")
+            time.sleep(60)
+
+        time.sleep(3)
+
+
+# ============================================================
+# FLASK ROUTES
+# ============================================================
+@app.route("/health")
+def health():
+    return jsonify({"status": "ok", "matches": TOTAL_MATCHES}), 200
+
+
+@app.route("/")
+def home():
+    return jsonify({
+        "service": "BTC Generator + Checker",
+        "matches_found": TOTAL_MATCHES,
+        "health": "/health"
+    })
+
+
+# ============================================================
+# START
+# ============================================================
+if __name__ == "__main__":
+    print("╔" + "═" * 68 + "╗")
+    print("║" + " BTC PIPELINE — RENDER + TELEGRAM + NEON ".center(68) + "║")
+    print("╠" + "═" * 68 + "╣")
+    print(f"║  Keys per iteration : {PRIVATE_KEYS_PER_ITERATION:,}")
+    print(f"║  Chunk size         : {CHUNK_SIZE:,}")
+    print(f"║  Telegram           : {'✅ Configured' if TELEGRAM_BOT_TOKEN else '❌ Missing'}")
+    print(f"║  Neon Postgres      : {'✅ Configured' if DATABASE_URL else '❌ Disabled'}")
+    print(f"║  Target file        : {TARGET_FILE}")
+    print("╚" + "═" * 68 + "╝")
+
+    # Start background worker
+    t = threading.Thread(target=worker, daemon=True)
+    t.start()
+
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port, debug=False)
